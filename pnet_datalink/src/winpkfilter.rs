@@ -9,10 +9,11 @@ use windows::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceGuidToLuid, ConvertInterfaceLuidToIndex,
 };
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
 
 use std::collections::VecDeque;
 use std::io;
+use std::time::{Duration, Instant};
 
 /// The WinpkFilter's specific configuration.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -21,6 +22,9 @@ pub struct Config {
     pub write_buffer_size: usize,
     /// Size of buffer to use when reading packets.
     pub read_buffer_size: usize,
+    /// The maximum time `next()` waits for a frame before returning `ErrorKind::TimedOut`.
+    /// `None` waits until a frame arrives.
+    pub read_timeout: Option<Duration>,
 }
 
 impl<'a> From<&'a super::Config> for Config {
@@ -28,6 +32,7 @@ impl<'a> From<&'a super::Config> for Config {
         Config {
             write_buffer_size: config.write_buffer_size,
             read_buffer_size: config.read_buffer_size,
+            read_timeout: config.read_timeout,
         }
     }
 }
@@ -37,6 +42,7 @@ impl Default for Config {
         Config {
             write_buffer_size: 4096,
             read_buffer_size: 4096,
+            read_timeout: None,
         }
     }
 }
@@ -141,6 +147,7 @@ pub fn channel(
         read_buffer: IntermediateBuffer::default(),
         packets: VecDeque::new(),
         packet_data: vec![0u8; config.read_buffer_size],
+        read_timeout: config.read_timeout,
     });
 
     Ok(super::Channel::Ethernet(sender, receiver))
@@ -215,6 +222,7 @@ struct DataLinkReceiverImpl {
     read_buffer: IntermediateBuffer,
     packets: VecDeque<Vec<u8>>,
     packet_data: Vec<u8>,
+    read_timeout: Option<Duration>,
 }
 
 impl DataLinkReceiver for DataLinkReceiverImpl {
@@ -225,17 +233,13 @@ impl DataLinkReceiver for DataLinkReceiverImpl {
             return Ok(&self.packet_data);
         }
 
-        // Wait for packets to arrive
-        loop {
-            // Wait for the event to signal that packets are available
-            let wait_result = unsafe { WaitForSingleObject(self.event, 100) }; // 100ms timeout
+        let deadline = self.read_timeout.map(|timeout| Instant::now() + timeout);
 
-            if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_TIMEOUT {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other, 
-                    "Event wait failed"
-                ));
-            }
+        loop {
+            // The event is manual-reset, so reset it before draining; a packet queued
+            // during the drain signals it again and the wait below returns immediately
+            unsafe { ResetEvent(self.event) }
+                .map_err(|e| io::Error::other(format!("Failed to reset event: {}", e)))?;
 
             // Try to read packets while they're available
             loop {
@@ -267,9 +271,26 @@ impl DataLinkReceiver for DataLinkReceiverImpl {
                 return Ok(&self.packet_data);
             }
 
-            // If no packets available and this was a timeout, continue waiting
-            if wait_result == WAIT_TIMEOUT {
-                continue;
+            // Wait for the event to signal that packets are available, in slices of at
+            // most 100ms, and give up once the read timeout (if any) has expired
+            let wait_ms = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::from(io::ErrorKind::TimedOut));
+                    }
+                    remaining.as_millis().clamp(1, 100) as u32
+                }
+                None => 100,
+            };
+
+            let wait_result = unsafe { WaitForSingleObject(self.event, wait_ms) };
+
+            if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_TIMEOUT {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Event wait failed"
+                ));
             }
         }
     }

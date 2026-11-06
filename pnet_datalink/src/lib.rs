@@ -146,7 +146,7 @@ pub struct Config {
     /// The size of buffer to use when reading packets. Defaults to 4096.
     pub read_buffer_size: usize,
 
-    /// Linux/BPF/Netmap only: The read timeout. Defaults to None.
+    /// Linux/BPF/Netmap/WinpkFilter only: The read timeout. Defaults to None.
     pub read_timeout: Option<Duration>,
 
     /// Linux/BPF/Netmap only: The write timeout. Defaults to None.
